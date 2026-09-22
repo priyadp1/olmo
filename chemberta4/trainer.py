@@ -25,6 +25,30 @@ from chemberta4.model import ClassificationHead, RegressionHead
 from chemberta4.utils import get_device_map, log0
 
 
+def _resize_embeddings_to_tokenizer(model, tokenizer) -> None:
+    """Resize a just-loaded checkpoint's embeddings to match tokenizer.
+
+    Some checkpoints (e.g. ChemFM) ship with a vocab size that doesn't match
+    the tokenizer being used, so the input/output embeddings must be resized
+    before training or forward passes will index out of range.
+    """
+    target_vocab_size = len(tokenizer)
+    current_vocab_size = model.get_input_embeddings().weight.shape[0]
+    if target_vocab_size != current_vocab_size:
+        model.resize_token_embeddings(target_vocab_size)
+        model.config.vocab_size = target_vocab_size
+    if tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+
+def modify_olmo_tokenizer_to_chemfm(model, chemfm_tokenizer_dir):
+    """Swap a pl.LightningModule's tokenizer for ChemFM's own tokenizer."""
+    chemfm_tokenizer = AutoTokenizer.from_pretrained(chemfm_tokenizer_dir)
+    if chemfm_tokenizer.pad_token is None:
+        chemfm_tokenizer.pad_token = chemfm_tokenizer.eos_token
+    model.tokenizer = chemfm_tokenizer
+
+
 class OLMoClassifier(pl.LightningModule):
     """This class implements a PyTorch Lightning module for molecular classification tasks.
 
@@ -59,6 +83,7 @@ class OLMoClassifier(pl.LightningModule):
     def __init__(
         self,
         model_name: str = "allenai/OLMo-7B-hf",
+        tokenizer_name: Optional[str] = None,
         num_tasks: int = 1,
         task_type: str = "single_task",
         finetune_strategy: str = "qlora",
@@ -75,6 +100,10 @@ class OLMoClassifier(pl.LightningModule):
         ----------
         model_name : str
             HuggingFace model identifier.
+        tokenizer_name : str, optional
+            HuggingFace tokenizer identifier/path to use instead of
+            'model_name's own tokenizer (e.g. ChemFM's tokenizer over an
+            OLMo checkpoint). Embeddings are resized to match.
         num_tasks : int
             Number of classification tasks/labels.
         task_type : str
@@ -148,7 +177,10 @@ class OLMoClassifier(pl.LightningModule):
 
         # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(hp.model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        if hp.tokenizer_name:
+            modify_olmo_tokenizer_to_chemfm(self, hp.tokenizer_name)
 
         # Quantization config (only for qlora)
         bnb_config = None
@@ -184,6 +216,7 @@ class OLMoClassifier(pl.LightningModule):
             device_map=None,
             attn_implementation="flash_attention_2")
 
+        _resize_embeddings_to_tokenizer(base, self.tokenizer)
 
         if hp.finetune_strategy == "qlora":
             # Activation checkpointing is disabled (qwen3_5's forward is not
@@ -458,6 +491,7 @@ class OLMoRegressor(pl.LightningModule):
     def __init__(
         self,
         model_name: str = "allenai/OLMo-7B-hf",
+        tokenizer_name: Optional[str] = None,
         finetune_strategy: str = "qlora",
         lr: float = 2e-4,
         weight_decay: float = 0.01,
@@ -474,6 +508,10 @@ class OLMoRegressor(pl.LightningModule):
         ----------
         model_name : str
             HuggingFace model identifier.
+        tokenizer_name : str, optional
+            HuggingFace tokenizer identifier/path to use instead of
+            'model_name's own tokenizer (e.g. ChemFM's tokenizer over an
+            OLMo checkpoint). Embeddings are resized to match.
         finetune_strategy : str
             One of 'qlora', 'lora', or 'full_finetune'.
         lr : float
@@ -511,7 +549,10 @@ class OLMoRegressor(pl.LightningModule):
         hp = self.hparams
 
         self.tokenizer = AutoTokenizer.from_pretrained(hp.model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        if hp.tokenizer_name:
+            modify_olmo_tokenizer_to_chemfm(self, hp.tokenizer_name)
 
         bnb_config = None
         if hp.finetune_strategy == "qlora":
@@ -547,6 +588,8 @@ class OLMoRegressor(pl.LightningModule):
             low_cpu_mem_usage=True,
             device_map=None,
             attn_implementation="flash_attention_2")
+
+        _resize_embeddings_to_tokenizer(base, self.tokenizer)
 
         if hp.finetune_strategy == "qlora":
             # Activation checkpointing is disabled (qwen3_5's forward is not

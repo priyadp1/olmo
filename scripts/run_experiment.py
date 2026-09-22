@@ -51,6 +51,10 @@ def parse_args() -> argparse.Namespace:
 
     # Model
     parser.add_argument("--model_name", type=str, default=None)
+    parser.add_argument("--tokenizer_name", type=str, default=None,
+                        help="Tokenizer to use instead of model_name's own "
+                        "(e.g. a ChemFM tokenizer directory over an OLMo "
+                        "checkpoint). Embeddings are resized to match.")
     parser.add_argument("--finetune_strategy", type=str, choices=["qlora", "lora", "full_finetune"], default=None,
                         help="Finetuning strategy: qlora (4-bit quantized LoRA), lora (LoRA without quantization), full_finetune (all parameters)")
 

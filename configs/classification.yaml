@@ -2,6 +2,7 @@ data_dir: datasets
 
 # Model
 model_name: allenai/OLMo-7B-hf
+tokenizer_name: null
 finetune_strategy: qlora
 
 # Training

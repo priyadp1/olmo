@@ -1,4 +1,5 @@
 import argparse
+import os
 from functools import partial
 
 import torch
@@ -12,9 +13,18 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.fsdp import ShardingStrategy
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
+from chemberta4.trainer import _resize_embeddings_to_tokenizer, modify_olmo_tokenizer_to_chemfm
+
+# chemberta4/ChemFM (cloned locally) holds ChemFM's tokenizer; pass its
+# path via --tokenizer_name to continue-pretrain OLMo with ChemFM's vocab
+# (embeddings are resized to match in OLMoFSDP.configure_model).
+DEFAULT_CHEMFM_TOKENIZER_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ChemFM",
+    "finetuning", "property_prediction", "tokenizer")
+
 
 class OLMoFSDP(pl.LightningModule):
-    def __init__(self, model_id, save_name, lr=1e-5, weight_decay=0.01, warmup_ratio=0.1):
+    def __init__(self, model_id, save_name, tokenizer_name=None, lr=1e-5, weight_decay=0.01, warmup_ratio=0.1):
         super().__init__()
         self.save_hyperparameters()
         self.model_id = model_id
@@ -25,6 +35,9 @@ class OLMoFSDP(pl.LightningModule):
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if tokenizer_name:
+            modify_olmo_tokenizer_to_chemfm(self, tokenizer_name)
 
     def configure_model(self):
         if self.model is not None:
@@ -39,6 +52,7 @@ class OLMoFSDP(pl.LightningModule):
             device_map=None,
             attn_implementation="flash_attention_2",
         )
+        _resize_embeddings_to_tokenizer(self.model, self.tokenizer)
 
 
     def forward(self, input_ids, attention_mask, labels=None):
@@ -198,6 +212,10 @@ class PubChemDataModule(pl.LightningDataModule):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FSDP full finetune on PubChem-10M SMILES (txt file)")
     parser.add_argument("--model_id", type=str, default="allenai/OLMo-7B-hf")
+    parser.add_argument("--tokenizer_name", type=str, default=None,
+                        help="Tokenizer to use instead of model_id's own "
+                        f"(e.g. ChemFM's tokenizer: {DEFAULT_CHEMFM_TOKENIZER_DIR}). "
+                        "Embeddings are resized to match.")
     parser.add_argument("--save_name", type=str, default="harindhar10/OLMo-7B-PubChem10M-full-finetune")
     parser.add_argument("--data_file", type=str, default="pubchem-10m.txt",
                         help="Path to text file with one SMILES string per line")
@@ -246,6 +264,7 @@ if __name__ == "__main__":
     pl_model = OLMoFSDP(
         model_id=args.model_id,
         save_name=args.save_name,
+        tokenizer_name=args.tokenizer_name,
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
@@ -345,7 +364,10 @@ if __name__ == "__main__":
             trust_remote_code=True,
             low_cpu_mem_usage=True,
         )
-        # reload_model.resize_token_embeddings(len(pl_model.tokenizer))
+        # Match the embedding resize done in configure_model() before training,
+        # or load_state_dict below will fail on an embedding shape mismatch
+        # whenever --tokenizer_name swapped in a different-vocab tokenizer.
+        _resize_embeddings_to_tokenizer(reload_model, pl_model.tokenizer)
 
         print('Reloading model from checkpoint:', ckpt_path)
 
@@ -356,10 +378,7 @@ if __name__ == "__main__":
 
         reload_model.push_to_hub(args.save_name)
 
-        tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.push_to_hub(args.save_name)
+        pl_model.tokenizer.push_to_hub(args.save_name)
 
         card_data = ModelCardData(
             language="en",

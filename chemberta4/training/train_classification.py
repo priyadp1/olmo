@@ -35,6 +35,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torchmetrics import Accuracy, AUROC
 
+# chemberta4/ChemFM (cloned locally) holds ChemFM's tokenizer; pass its
+# path via --tokenizer_name to run OLMo with ChemFM's vocab (embeddings
+# are resized to match in OLMoClassifier).
+DEFAULT_CHEMFM_TOKENIZER_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ChemFM",
+    "finetuning", "property_prediction", "tokenizer")
+
 
 def _is_transformer_layer(module) -> bool:
     """Model-agnostic match for a transformer decoder block.
@@ -64,8 +71,9 @@ def run_classification_experiment(args: SimpleNamespace, task_name: str) -> None
     log0(f"Columns: {task_config.task_columns[:3]}")
 
     # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(getattr(args, "tokenizer_name", None) or args.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # Load data
     train_df = pd.read_csv(f"{args.data_dir}/{task_name}/train.csv")
@@ -119,6 +127,7 @@ def run_classification_experiment(args: SimpleNamespace, task_name: str) -> None
     # Model
     model = OLMoClassifier(
         model_name=args.model_name,
+        tokenizer_name=getattr(args, "tokenizer_name", None),
         num_tasks=len(task_config.task_columns),
         task_type=task_config.task_type,
         finetune_strategy=args.finetune_strategy,
