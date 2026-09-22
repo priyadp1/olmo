@@ -15,9 +15,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from chemberta4.trainer import _resize_embeddings_to_tokenizer, modify_olmo_tokenizer_to_chemfm
 
-# chemberta4/ChemFM (cloned locally) holds ChemFM's tokenizer; pass its
-# path via --tokenizer_name to continue-pretrain OLMo with ChemFM's vocab
-# (embeddings are resized to match in OLMoFSDP.configure_model).
+
 DEFAULT_CHEMFM_TOKENIZER_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ChemFM",
     "finetuning", "property_prediction", "tokenizer")
@@ -364,9 +362,6 @@ if __name__ == "__main__":
             trust_remote_code=True,
             low_cpu_mem_usage=True,
         )
-        # Match the embedding resize done in configure_model() before training,
-        # or load_state_dict below will fail on an embedding shape mismatch
-        # whenever --tokenizer_name swapped in a different-vocab tokenizer.
         _resize_embeddings_to_tokenizer(reload_model, pl_model.tokenizer)
 
         print('Reloading model from checkpoint:', ckpt_path)
