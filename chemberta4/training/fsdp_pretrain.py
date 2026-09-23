@@ -13,7 +13,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.fsdp import ShardingStrategy
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from chemberta4.trainer import _resize_embeddings_to_tokenizer, modify_olmo_tokenizer_to_chemfm
+from chemberta4.trainer import _replace_embeddings_for_tokenizer, modify_olmo_tokenizer_to_chemfm
 
 
 DEFAULT_CHEMFM_TOKENIZER_DIR = os.path.join(
@@ -50,7 +50,8 @@ class OLMoFSDP(pl.LightningModule):
             device_map=None,
             attn_implementation="sdpa",
         )
-        _resize_embeddings_to_tokenizer(self.model, self.tokenizer)
+        if self.hparams.tokenizer_name:
+            _replace_embeddings_for_tokenizer(self.model, self.tokenizer)
 
 
     def forward(self, input_ids, attention_mask, labels=None):
@@ -362,7 +363,8 @@ if __name__ == "__main__":
             trust_remote_code=True,
             low_cpu_mem_usage=True,
         )
-        _resize_embeddings_to_tokenizer(reload_model, pl_model.tokenizer)
+        if pl_model.hparams.tokenizer_name:
+            _replace_embeddings_for_tokenizer(reload_model, pl_model.tokenizer)
 
         print('Reloading model from checkpoint:', ckpt_path)
 

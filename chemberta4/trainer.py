@@ -25,18 +25,19 @@ from chemberta4.model import ClassificationHead, RegressionHead
 from chemberta4.utils import get_device_map, log0
 
 
-def _resize_embeddings_to_tokenizer(model, tokenizer) -> None:
-    """Resize a just-loaded checkpoint's embeddings to match tokenizer.
-
-    Some checkpoints (e.g. ChemFM) ship with a vocab size that doesn't match
-    the tokenizer being used, so the input/output embeddings must be resized
-    before training or forward passes will index out of range.
-    """
+def _replace_embeddings_for_tokenizer(model, tokenizer) -> None:
+    """Replace the model's input embeddings with a new embedding layer that matches the tokenizer's vocab size. """
+    old_embeddings = model.get_input_embeddings()
     target_vocab_size = len(tokenizer)
-    current_vocab_size = model.get_input_embeddings().weight.shape[0]
-    if target_vocab_size != current_vocab_size:
-        model.resize_token_embeddings(target_vocab_size)
-        model.config.vocab_size = target_vocab_size
+    hidden_size = old_embeddings.embedding_dim
+    new_embeddings = torch.nn.Embedding(target_vocab_size, hidden_size , padding_idx=tokenizer.pad_token_id , device = old_embeddings.weight.device , dtype = old_embeddings.weight.dtype)
+    initializer_range = getattr(model.config, "initializer_range", 0.02)
+    torch.nn.init.normal_(new_embeddings.weight, mean=0.0, std=initializer_range)
+    if tokenizer.pad_token_id is not None:
+        with torch.no_grad():
+            new_embeddings.weight[tokenizer.pad_token_id].zero_()
+    model.set_input_embeddings(new_embeddings)
+    model.config.vocab_size = target_vocab_size
     if tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
@@ -216,7 +217,8 @@ class OLMoClassifier(pl.LightningModule):
             device_map=None,
             attn_implementation="sdpa")
 
-        _resize_embeddings_to_tokenizer(base, self.tokenizer)
+        if hp.tokenizer_name:
+            _replace_embeddings_for_tokenizer(base, self.tokenizer)
 
         if hp.finetune_strategy == "qlora":
             # Activation checkpointing is disabled (qwen3_5's forward is not
@@ -230,9 +232,9 @@ class OLMoClassifier(pl.LightningModule):
                 r=hp.lora_r,
                 lora_alpha=hp.lora_alpha,
                 target_modules=["q_proj",
-                                "k_proj", 
-                                "v_proj", 
-                                "o_proj",  
+                                "k_proj",
+                                "v_proj",
+                                "o_proj",
                                 "gate_proj",
                                 "up_proj",
                                 "down_proj",],
@@ -244,6 +246,17 @@ class OLMoClassifier(pl.LightningModule):
 
             # if self.global_rank == 0:
             #     base.print_trainable_parameters()
+
+        if hp.tokenizer_name:
+            # PEFT/kbit setup above freezes the base model; the newly
+            # created ChemFM embeddings must stay trainable regardless.
+            embedding_weight = base.get_input_embeddings().weight
+            embedding_weight.requires_grad_(True)
+            log0(
+                f"[ChemFM embeddings] "
+                f"shape={tuple(embedding_weight.shape)}, "
+                f"trainable={embedding_weight.requires_grad}"
+            )
 
         self.model = ClassificationHead(base, hp.num_tasks, hp.task_type)
 
@@ -589,7 +602,8 @@ class OLMoRegressor(pl.LightningModule):
             device_map=None,
             attn_implementation="sdpa")
 
-        _resize_embeddings_to_tokenizer(base, self.tokenizer)
+        if hp.tokenizer_name:
+            _replace_embeddings_for_tokenizer(base, self.tokenizer)
 
         if hp.finetune_strategy == "qlora":
             # Activation checkpointing is disabled (qwen3_5's forward is not
@@ -609,8 +623,8 @@ class OLMoRegressor(pl.LightningModule):
                     r=hp.lora_r,
                     lora_alpha=hp.lora_alpha,
                     target_modules=["q_proj",
-                                    "k_proj", 
-                                    "v_proj", 
+                                    "k_proj",
+                                    "v_proj",
                                     "o_proj",],
                     lora_dropout=hp.lora_dropout,
                     bias="none",
@@ -621,6 +635,17 @@ class OLMoRegressor(pl.LightningModule):
             if self.global_rank == 0 and not hp.adapter_path:
                 # PEFT's own count, taken before FSDP wraps (authoritative).
                 base.print_trainable_parameters()
+
+        if hp.tokenizer_name:
+            # PEFT/kbit setup above freezes the base model; the newly
+            # created ChemFM embeddings must stay trainable regardless.
+            embedding_weight = base.get_input_embeddings().weight
+            embedding_weight.requires_grad_(True)
+            log0(
+                f"[ChemFM embeddings] "
+                f"shape={tuple(embedding_weight.shape)}, "
+                f"trainable={embedding_weight.requires_grad}"
+            )
 
         self.model = RegressionHead(base)
         if hp.regressor_path:
