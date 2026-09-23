@@ -26,6 +26,7 @@ Examples:
 """
 
 import argparse
+import logging
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -33,6 +34,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import pytorch_lightning as pl
 
 from chemberta4.utils import get_task, log0, prepare_config, set_seed
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 
 def parse_args() -> argparse.Namespace:
