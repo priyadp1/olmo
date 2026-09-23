@@ -203,7 +203,7 @@ class OLMoClassifier(pl.LightningModule):
                 use_cache=False,
                 low_cpu_mem_usage=True,
                 device_map=None,
-                attn_implementation="flash_attention_2"
+                attn_implementation="sdpa"
             )
         else:
             base = AutoModel.from_pretrained(
@@ -214,7 +214,7 @@ class OLMoClassifier(pl.LightningModule):
             use_cache=False,
             low_cpu_mem_usage=True,
             device_map=None,
-            attn_implementation="flash_attention_2")
+            attn_implementation="sdpa")
 
         _resize_embeddings_to_tokenizer(base, self.tokenizer)
 
@@ -576,7 +576,7 @@ class OLMoRegressor(pl.LightningModule):
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
                 device_map=None,
-                attn_implementation="flash_attention_2"
+                attn_implementation="sdpa"
             )
 
         else:
@@ -587,7 +587,7 @@ class OLMoRegressor(pl.LightningModule):
             trust_remote_code=True,
             low_cpu_mem_usage=True,
             device_map=None,
-            attn_implementation="flash_attention_2")
+            attn_implementation="sdpa")
 
         _resize_embeddings_to_tokenizer(base, self.tokenizer)
 

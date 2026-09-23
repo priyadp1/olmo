@@ -37,7 +37,7 @@ class OLMoFSDP(pl.LightningModule):
             use_cache=False,
             low_cpu_mem_usage=True,
             device_map=None,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
 
     def forward(self, input_ids, attention_mask, labels=None):
