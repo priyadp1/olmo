@@ -102,12 +102,18 @@ class QLoRAAdapterCheckpoint(pl.Callback):
 
     def _save_adapter(self, pl_module: OLMoRegressor) -> None:
         os.makedirs(self.best_adapter_path, exist_ok=True)
-
         backbone = pl_module.model.backbone
         backbone.save_pretrained(self.best_adapter_path)
 
         if pl_module.tokenizer is not None:
             pl_module.tokenizer.save_pretrained(self.best_adapter_path)
+
+        if pl_module.hparams.tokenizer_name:
+            embedding_weight = backbone.get_input_embeddings().weight.detach().cpu()
+            torch.save(
+                embedding_weight,
+                os.path.join(self.best_adapter_path, "chemfm_embeddings.pt"),
+            )
 
         regressor_state = {
             name: tensor.detach().cpu()

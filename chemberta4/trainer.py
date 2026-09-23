@@ -6,6 +6,7 @@ with support for QLoRA and full finetuning.
 """
 
 
+import os
 from typing import Any, Dict, Optional
 
 import torch
@@ -40,6 +41,25 @@ def _replace_embeddings_for_tokenizer(model, tokenizer) -> None:
     model.config.vocab_size = target_vocab_size
     if tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
+
+
+def _load_chemfm_embeddings_if_present(model, adapter_path: Optional[str]) -> None:
+    """Load a previously trained ChemFM embedding matrix saved next to a PEFT adapter.
+
+    QLoRA reload rebuilds the embedding layer via
+    '_replace_embeddings_for_tokenizer' (random init), then overwrites it here
+    with the trained weights the checkpoint callback saved alongside the
+    adapter, if any were saved.
+    """
+    if not adapter_path:
+        return
+    embed_path = os.path.join(adapter_path, "chemfm_embeddings.pt")
+    if not os.path.exists(embed_path):
+        return
+    embedding = model.get_input_embeddings()
+    saved_weight = torch.load(embed_path, map_location=embedding.weight.device)
+    with torch.no_grad():
+        embedding.weight.copy_(saved_weight.to(embedding.weight.dtype))
 
 
 def modify_olmo_tokenizer_to_chemfm(model, chemfm_tokenizer_dir):
@@ -94,6 +114,8 @@ class OLMoClassifier(pl.LightningModule):
         lora_r: int = 32,
         lora_alpha: int = 64,
         lora_dropout: float = 0.05,
+        adapter_path: Optional[str] = None,
+        classifier_path: Optional[str] = None,
     ):
         """Initialise OLMoClassifier.
 
@@ -124,6 +146,13 @@ class OLMoClassifier(pl.LightningModule):
             LoRA alpha (typically 2× rank).
         lora_dropout : float
             LoRA dropout rate.
+        adapter_path : str, optional
+            Path to a saved PEFT adapter directory (as written by
+            'QLoRAClassifierCheckpoint') to reload for qlora evaluation
+            instead of training a new one.
+        classifier_path : str, optional
+            Path to a saved classification head checkpoint (as written by
+            'QLoRAClassifierCheckpoint') to reload alongside 'adapter_path'.
 
         Examples
         --------
@@ -219,6 +248,7 @@ class OLMoClassifier(pl.LightningModule):
 
         if hp.tokenizer_name:
             _replace_embeddings_for_tokenizer(base, self.tokenizer)
+            _load_chemfm_embeddings_if_present(base, hp.adapter_path)
 
         if hp.finetune_strategy == "qlora":
             # Activation checkpointing is disabled (qwen3_5's forward is not
@@ -228,23 +258,30 @@ class OLMoClassifier(pl.LightningModule):
                 base, use_gradient_checkpointing=False
             )
         if hp.finetune_strategy != "full_finetune":
-            lora_cfg = LoraConfig(
-                r=hp.lora_r,
-                lora_alpha=hp.lora_alpha,
-                target_modules=["q_proj",
-                                "k_proj",
-                                "v_proj",
-                                "o_proj",
-                                "gate_proj",
-                                "up_proj",
-                                "down_proj",],
-                lora_dropout=hp.lora_dropout,
-                bias="none",
-                task_type="FEATURE_EXTRACTION",
-            )
-            base = get_peft_model(base, lora_cfg)
+            if hp.adapter_path:
+                base = PeftModel.from_pretrained(
+                    base,
+                    hp.adapter_path,
+                    is_trainable=False,
+                )
+            else:
+                lora_cfg = LoraConfig(
+                    r=hp.lora_r,
+                    lora_alpha=hp.lora_alpha,
+                    target_modules=["q_proj",
+                                    "k_proj",
+                                    "v_proj",
+                                    "o_proj",
+                                    "gate_proj",
+                                    "up_proj",
+                                    "down_proj",],
+                    lora_dropout=hp.lora_dropout,
+                    bias="none",
+                    task_type="FEATURE_EXTRACTION",
+                )
+                base = get_peft_model(base, lora_cfg)
 
-            # if self.global_rank == 0:
+            # if self.global_rank == 0 and not hp.adapter_path:
             #     base.print_trainable_parameters()
 
         if hp.tokenizer_name:
@@ -259,6 +296,11 @@ class OLMoClassifier(pl.LightningModule):
             )
 
         self.model = ClassificationHead(base, hp.num_tasks, hp.task_type)
+        if hp.classifier_path:
+            classifier_state = torch.load(hp.classifier_path, map_location="cpu")
+            if "classifier" in classifier_state:
+                classifier_state = classifier_state["classifier"]
+            self.model.classifier.load_state_dict(classifier_state)
 
     def forward(
         self,
@@ -604,6 +646,7 @@ class OLMoRegressor(pl.LightningModule):
 
         if hp.tokenizer_name:
             _replace_embeddings_for_tokenizer(base, self.tokenizer)
+            _load_chemfm_embeddings_if_present(base, hp.adapter_path)
 
         if hp.finetune_strategy == "qlora":
             # Activation checkpointing is disabled (qwen3_5's forward is not
