@@ -35,9 +35,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torchmetrics import Accuracy, AUROC
 
-# chemberta4/ChemFM (cloned locally) holds ChemFM's tokenizer; pass its
-# path via --tokenizer_name to run OLMo with ChemFM's vocab (embeddings
-# are resized to match in OLMoClassifier).
+
 DEFAULT_CHEMFM_TOKENIZER_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ChemFM",
     "finetuning", "property_prediction", "tokenizer")
