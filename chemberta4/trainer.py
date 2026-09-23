@@ -55,11 +55,17 @@ def _load_chemfm_embeddings_if_present(model, adapter_path: Optional[str]) -> No
         return
     embed_path = os.path.join(adapter_path, "chemfm_embeddings.pt")
     if not os.path.exists(embed_path):
+        log0(
+            f"[ChemFM embeddings] WARNING: no saved embeddings found at "
+            f"{embed_path}; keeping the freshly random-initialized matrix. "
+            "Reloaded model will NOT have the trained embeddings."
+        )
         return
     embedding = model.get_input_embeddings()
     saved_weight = torch.load(embed_path, map_location=embedding.weight.device)
     with torch.no_grad():
         embedding.weight.copy_(saved_weight.to(embedding.weight.dtype))
+    log0(f"[ChemFM embeddings] restored trained weights from {embed_path}")
 
 
 def modify_olmo_tokenizer_to_chemfm(model, chemfm_tokenizer_dir):
@@ -301,6 +307,7 @@ class OLMoClassifier(pl.LightningModule):
             if "classifier" in classifier_state:
                 classifier_state = classifier_state["classifier"]
             self.model.classifier.load_state_dict(classifier_state)
+            log0(f"[classifier head] restored trained weights from {hp.classifier_path}")
 
     def forward(
         self,
@@ -696,6 +703,7 @@ class OLMoRegressor(pl.LightningModule):
             if "regressor" in regressor_state:
                 regressor_state = regressor_state["regressor"]
             self.model.regressor.load_state_dict(regressor_state)
+            log0(f"[regressor head] restored trained weights from {hp.regressor_path}")
 
     def forward(
         self,

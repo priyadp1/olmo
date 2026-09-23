@@ -343,6 +343,11 @@ def run_classification_experiment(args: SimpleNamespace, task_name: str) -> None
 
     log0(f"Done! Best validation ROC AUC: {checkpoint_callback.best_model_score:.4f}")
 
+    in_memory_test_results = None
+    if args.finetune_strategy == "qlora":
+        log0("Evaluating in-memory (pre-reload) model on the test set for debugging...")
+        in_memory_test_results = trainer.test(model, test_loader)
+
     # Cleanup GPU memory for next task
     del model
     gc.collect()
@@ -384,6 +389,12 @@ def run_classification_experiment(args: SimpleNamespace, task_name: str) -> None
         model = OLMoClassifier.load_from_checkpoint(best_ckpt)
 
     test_results = trainer.test(model, test_loader)
+
+    if in_memory_test_results:
+        log0(
+            f"[debug] in-memory test/roc_auc={in_memory_test_results[0].get('test/roc_auc')} "
+            f"vs reloaded test/roc_auc={test_results[0].get('test/roc_auc')}"
+        )
 
     if args.wandb and test_results:
         import wandb
