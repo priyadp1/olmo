@@ -48,7 +48,7 @@ class OLMoFSDP(pl.LightningModule):
             use_cache=False,
             low_cpu_mem_usage=True,
             device_map=None,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
         _resize_embeddings_to_tokenizer(self.model, self.tokenizer)
 
