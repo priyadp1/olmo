@@ -52,6 +52,16 @@ def _replace_embeddings_for_tokenizer(model, tokenizer) -> None:
         with torch.no_grad():
             new_embeddings.weight[tokenizer.pad_token_id].zero_()
     model.set_input_embeddings(new_embeddings)
+    old_head = model.get_output_embeddings()
+    if old_head is not None:
+        new_head = torch.nn.Linear(hidden_size, target_vocab_size, bias=False,
+                                   device=old_head.weight.device, dtype=old_head.weight.dtype)
+        if getattr(model.config, "tie_word_embeddings", False):
+            new_head.weight = new_embeddings.weight
+        else:
+            torch.nn.init.normal_(new_head.weight, mean=0.0, std=initializer_range)
+        model.set_output_embeddings(new_head)
+
     model.config.vocab_size = target_vocab_size
     if tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
