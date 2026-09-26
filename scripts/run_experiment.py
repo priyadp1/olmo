@@ -64,6 +64,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--finetune_strategy", type=str, choices=["qlora", "lora", "full_finetune"], default=None,
                         help="Finetuning strategy: qlora (4-bit quantized LoRA), lora (LoRA without quantization), full_finetune (all parameters)")
 
+    parser.add_argument("--precision", type=str, choices=["bf16-true", "bf16-mixed", "16-mixed", "32-true"], default=None,
+                        help="Lightning precision (classification/regression). Use 16-mixed on GPUs "
+                        "without bf16 support (e.g. Kaggle T4/P100)")
+
     # Training
     parser.add_argument("--max_len", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)

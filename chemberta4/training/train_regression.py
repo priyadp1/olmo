@@ -212,6 +212,7 @@ def run_regression_experiment(args: SimpleNamespace, task_name: str) -> None:
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        precision=args.precision,
     )
 
     # Callbacks
@@ -298,7 +299,7 @@ def run_regression_experiment(args: SimpleNamespace, task_name: str) -> None:
         # bf16-true casts the whole module to bf16 so FSDP's flatten group is
         # uniform (vs bf16-mixed which keeps fp32 master params alongside the
         # bf16-storage quantized base, reintroducing the dtype mismatch).
-        precision="bf16-mixed",
+        precision=args.precision,
         accumulate_grad_batches=args.gradient_accum,
         val_check_interval=args.val_check_interval,
         callbacks=callbacks,
@@ -355,6 +356,7 @@ def run_regression_experiment(args: SimpleNamespace, task_name: str) -> None:
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
+            precision=args.precision,
             adapter_path=best_adapter_path,
             regressor_path=os.path.join(best_adapter_path, "regressor.pt"),
         )

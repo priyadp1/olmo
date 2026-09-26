@@ -26,6 +26,20 @@ from chemberta4.model import ClassificationHead, RegressionHead
 from chemberta4.utils import get_device_map, log0
 
 
+def _weights_dtype_for_precision(precision: str) -> torch.dtype:
+    """bf16 runs keep weights in bf16; fp16/fp32 runs keep fp32 master weights."""
+    return torch.bfloat16 if precision.startswith("bf16") else torch.float32
+
+
+def _compute_dtype_for_precision(precision: str) -> torch.dtype:
+    """dtype for bitsandbytes 4-bit matmuls under the given Lightning precision."""
+    if precision.startswith("bf16"):
+        return torch.bfloat16
+    if precision.startswith("16"):
+        return torch.float16
+    return torch.float32
+
+
 def _replace_embeddings_for_tokenizer(model, tokenizer) -> None:
     """Replace the model's input embeddings with a new embedding layer that matches the tokenizer's vocab size. """
     old_embeddings = model.get_input_embeddings()
@@ -122,6 +136,7 @@ class OLMoClassifier(pl.LightningModule):
         lora_dropout: float = 0.05,
         adapter_path: Optional[str] = None,
         classifier_path: Optional[str] = None,
+        precision: str = "bf16-true",
     ):
         """Initialise OLMoClassifier.
 
@@ -159,6 +174,9 @@ class OLMoClassifier(pl.LightningModule):
         classifier_path : str, optional
             Path to a saved classification head checkpoint (as written by
             'QLoRAClassifierCheckpoint') to reload alongside 'adapter_path'.
+        precision : str
+            Lightning precision the trainer runs with; sets the dtype the
+            backbone is loaded in (bf16 for 'bf16-*', fp32 otherwise).
 
         Examples
         --------
@@ -224,17 +242,17 @@ class OLMoClassifier(pl.LightningModule):
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=_compute_dtype_for_precision(hp.precision),
                 bnb_4bit_use_double_quant=True,
                 # See OLMoRegressor: bf16 storage keeps FSDP's flatten group uniform.
-                bnb_4bit_quant_storage=torch.bfloat16,
+                bnb_4bit_quant_storage=_weights_dtype_for_precision(hp.precision),
             )
 
 
         if hp.finetune_strategy != 'qlora':
             base = AutoModel.from_pretrained(
                 hp.model_name,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=_weights_dtype_for_precision(hp.precision),
                 trust_remote_code=True,
                 use_cache=False,
                 low_cpu_mem_usage=True,
@@ -245,7 +263,7 @@ class OLMoClassifier(pl.LightningModule):
             base = AutoModel.from_pretrained(
             hp.model_name,
             quantization_config = bnb_config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=_weights_dtype_for_precision(hp.precision),
             trust_remote_code=True,
             use_cache=False,
             low_cpu_mem_usage=True,
@@ -563,6 +581,7 @@ class OLMoRegressor(pl.LightningModule):
         lora_dropout: float = 0.05,
         adapter_path: Optional[str] = None,
         regressor_path: Optional[str] = None,
+        precision: str = "bf16-mixed",
     ):
         """Initialise OLMoRegressor.
 
@@ -592,6 +611,9 @@ class OLMoRegressor(pl.LightningModule):
             Path to a saved PEFT adapter to attach to the base model.
         regressor_path : str, optional
             Path to the saved regression-head state dict.
+        precision : str
+            Lightning precision the trainer runs with; sets the dtype the
+            backbone is loaded in (bf16 for 'bf16-*', fp32 otherwise).
         """
         super().__init__()
         self.save_hyperparameters()
@@ -621,20 +643,20 @@ class OLMoRegressor(pl.LightningModule):
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=_compute_dtype_for_precision(hp.precision),
                 bnb_4bit_use_double_quant=True,
                 # FSDP flattens each unit's params into one FlatParameter and
                 # requires a uniform dtype. The default 4-bit storage is uint8,
                 # which clashes with the bf16 LoRA/head params. Packing the 4-bit
                 # weights in a bf16 container keeps the whole flatten group bf16.
-                bnb_4bit_quant_storage=torch.bfloat16,
+                bnb_4bit_quant_storage=_weights_dtype_for_precision(hp.precision),
             )
 
 
         if hp.finetune_strategy != 'qlora':
             base = AutoModel.from_pretrained(
                 hp.model_name,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=_weights_dtype_for_precision(hp.precision),
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
                 device_map=None,
@@ -645,7 +667,7 @@ class OLMoRegressor(pl.LightningModule):
             base = AutoModel.from_pretrained(
             hp.model_name,
             quantization_config = bnb_config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=_weights_dtype_for_precision(hp.precision),
             trust_remote_code=True,
             low_cpu_mem_usage=True,
             device_map=None,

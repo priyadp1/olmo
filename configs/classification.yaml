@@ -4,6 +4,7 @@ data_dir: datasets
 model_name: allenai/OLMo-7B-hf
 tokenizer_name: null
 finetune_strategy: qlora
+precision: bf16-true
 
 # Training
 max_len: 128
