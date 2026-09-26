@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.strategies import FSDPStrategy
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from huggingface_hub import ModelCard, ModelCardData
+from huggingface_hub import HfApi, ModelCard, ModelCardData
 from torch.utils.data import DataLoader, Dataset
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.fsdp import ShardingStrategy
@@ -21,8 +21,14 @@ DEFAULT_CHEMFM_TOKENIZER_DIR = os.path.join(
     "finetuning", "property_prediction", "tokenizer")
 
 
+def weights_dtype_for_precision(precision):
+    """bf16 runs keep weights in bf16; fp16/fp32 runs keep fp32 master weights."""
+    return torch.bfloat16 if precision.startswith("bf16") else torch.float32
+
+
 class OLMoFSDP(pl.LightningModule):
-    def __init__(self, model_id, save_name, tokenizer_name=None, lr=1e-5, weight_decay=0.01, warmup_ratio=0.1):
+    def __init__(self, model_id, save_name, tokenizer_name=None, lr=1e-5, weight_decay=0.01, warmup_ratio=0.1,
+                 precision="bf16-mixed"):
         super().__init__()
         self.save_hyperparameters()
         self.model_id = model_id
@@ -43,7 +49,7 @@ class OLMoFSDP(pl.LightningModule):
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=weights_dtype_for_precision(self.hparams.precision),
             trust_remote_code=True,
             use_cache=False,
             low_cpu_mem_usage=True,
@@ -216,6 +222,12 @@ if __name__ == "__main__":
                         f"(e.g. ChemFM's tokenizer: {DEFAULT_CHEMFM_TOKENIZER_DIR}). "
                         "Embeddings are resized to match.")
     parser.add_argument("--save_name", type=str, default="harindhar10/OLMo-7B-PubChem10M-full-finetune")
+    parser.add_argument("--local_save_dir", type=str, default=None,
+                        help="Where to save the model if not logged in to Hugging Face "
+                        "(default: pretrained_models/<last part of save_name>)")
+    parser.add_argument("--precision", type=str, default="bf16-mixed",
+                        choices=["bf16-mixed", "bf16-true", "16-mixed", "32-true"],
+                        help="Lightning precision. Use 16-mixed on GPUs without bf16 (e.g. Kaggle T4/P100)")
     parser.add_argument("--data_file", type=str, default="pubchem-10m.txt",
                         help="Path to text file with one SMILES string per line")
     parser.add_argument("--batch_size", type=int, default=2)
@@ -267,6 +279,7 @@ if __name__ == "__main__":
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
+        precision=args.precision,
     )
 
     dm = PubChemDataModule(
@@ -331,7 +344,7 @@ if __name__ == "__main__":
         accelerator="gpu",
         devices=torch.cuda.device_count(),
         strategy=fsdp_strategy,
-        precision="bf16-mixed",
+        precision=args.precision,
         max_epochs=args.max_epochs,
         val_check_interval=1.0 / args.num_val_per_epoch,
         accumulate_grad_batches=args.accumulate_grad_batches,
@@ -359,7 +372,7 @@ if __name__ == "__main__":
         print('Reloading model from pretrained')
         reload_model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=weights_dtype_for_precision(args.precision),
             trust_remote_code=True,
             low_cpu_mem_usage=True,
         )
@@ -373,9 +386,11 @@ if __name__ == "__main__":
         cleaned = {k.replace("model.", "", 1): v for k, v in state.items()}
         reload_model.load_state_dict(cleaned, strict=True)
 
-        reload_model.push_to_hub(args.save_name)
-
-        pl_model.tokenizer.push_to_hub(args.save_name)
+        try:
+            HfApi().whoami()
+            hf_logged_in = True
+        except Exception:
+            hf_logged_in = False
 
         card_data = ModelCardData(
             language="en",
@@ -401,15 +416,25 @@ if __name__ == "__main__":
 | Gradient Accumulation Steps | `{args.accumulate_grad_batches}` |
 | Max Sequence Length | `{args.max_length}` |
 | Num Training Samples | `{args.num_samples}` |
-| Precision | `bf16-mixed` |
+| Precision | `{args.precision}` |
 | Gradient Clip Val | `1.0` |
 | Optimizer | AdamW (betas=(0.9, 0.95), eps=1e-5) |
 | LR Scheduler | Linear warmup + Cosine annealing (eta_min=1e-6) |
 """,
         )
-        card.push_to_hub(args.save_name)
 
-        print(f"Model + tokenizer + model card pushed to {args.save_name}")
+        if hf_logged_in:
+            reload_model.push_to_hub(args.save_name)
+            pl_model.tokenizer.push_to_hub(args.save_name)
+            card.push_to_hub(args.save_name)
+            print(f"Model + tokenizer + model card pushed to {args.save_name}")
+        else:
+            local_dir = args.local_save_dir or os.path.join("pretrained_models", args.save_name.split("/")[-1])
+            print(f"No Hugging Face login found; saving locally to {local_dir}")
+            reload_model.save_pretrained(local_dir)
+            pl_model.tokenizer.save_pretrained(local_dir)
+            card.save(os.path.join(local_dir, "README.md"))
+            print(f"Model + tokenizer + model card saved to {local_dir}")
 
     if wandb_logger:
         import wandb
