@@ -329,7 +329,8 @@ class OLMoClassifier(pl.LightningModule):
                 f"trainable={embedding_weight.requires_grad}"
             )
 
-        self.model = ClassificationHead(base, hp.num_tasks, hp.task_type)
+        self.model = ClassificationHead(base, hp.num_tasks, hp.task_type,
+                                        dtype=_weights_dtype_for_precision(hp.precision))
         if hp.classifier_path:
             classifier_state = torch.load(hp.classifier_path, map_location="cpu")
             if "classifier" in classifier_state:
@@ -729,7 +730,7 @@ class OLMoRegressor(pl.LightningModule):
                 f"trainable={embedding_weight.requires_grad}"
             )
 
-        self.model = RegressionHead(base)
+        self.model = RegressionHead(base, dtype=_weights_dtype_for_precision(hp.precision))
         if hp.regressor_path:
             regressor_state = torch.load(hp.regressor_path, map_location="cpu")
             if "regressor" in regressor_state:

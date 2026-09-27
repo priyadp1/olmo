@@ -107,7 +107,8 @@ class ClassificationHead(nn.Module):
         self,
         backbone: nn.Module,
         num_tasks: int = 1,
-        task_type: str = "single_task"
+        task_type: str = "single_task",
+        dtype: torch.dtype = torch.bfloat16,
     ):
         """Initialise ClassificationHead.
 
@@ -119,6 +120,9 @@ class ClassificationHead(nn.Module):
             Number of output classes/tasks.
         task_type : str
             'single_task' or 'multi_task'.
+        dtype : torch.dtype
+            dtype of the classifier weights; should match the backbone's
+            trainable params (fp32 under 16-mixed so the grad scaler works).
         """
         super().__init__()
         self.backbone = backbone
@@ -128,7 +132,7 @@ class ClassificationHead(nn.Module):
         # Output dimension: 2 for single_task (class logits), num_tasks for multi_task
         output_dim = 2 if task_type == "single_task" else num_tasks
 
-        self.classifier = nn.Linear(backbone.config.hidden_size, output_dim, dtype=torch.bfloat16)
+        self.classifier = nn.Linear(backbone.config.hidden_size, output_dim, dtype=dtype)
 
         # Initialize with small weights
         nn.init.normal_(self.classifier.weight, mean=0.0, std=0.02)
@@ -266,18 +270,21 @@ class RegressionHead(nn.Module):
     True
     """
 
-    def __init__(self, backbone: nn.Module):
+    def __init__(self, backbone: nn.Module, dtype: torch.dtype = torch.bfloat16):
         """Initialise RegressionHead.
 
         Parameters
         ----------
         backbone : nn.Module
             The base model (OLMo with LoRA).
+        dtype : torch.dtype
+            dtype of the regressor weights; should match the backbone's
+            trainable params (fp32 under 16-mixed so the grad scaler works).
         """
         super().__init__()
         self.backbone = backbone
         hidden_size = get_hidden_size(backbone.config)
-        self.regressor = nn.Linear(hidden_size, 1, dtype=torch.bfloat16)
+        self.regressor = nn.Linear(hidden_size, 1, dtype=dtype)
 
         # Initialize with small weights
         nn.init.normal_(self.regressor.weight, mean=0.0, std=0.02)
