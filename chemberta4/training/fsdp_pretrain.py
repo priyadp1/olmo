@@ -13,12 +13,10 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.fsdp import ShardingStrategy
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from chemberta4.trainer import _replace_embeddings_for_tokenizer, modify_olmo_tokenizer_to_chemfm
+from chemberta4.trainer import _extend_embeddings_for_tokenizer, extend_tokenizer_vocab
 
 
-DEFAULT_CHEMFM_TOKENIZER_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ChemFM",
-    "finetuning", "property_prediction", "tokenizer")
+DEFAULT_CHEMBERTA3_TOKENIZER = "seyonec/PubChem10M_SMILES_BPE_60k"
 
 
 def weights_dtype_for_precision(precision):
@@ -27,8 +25,8 @@ def weights_dtype_for_precision(precision):
 
 
 class OLMoFSDP(pl.LightningModule):
-    def __init__(self, model_id, save_name, tokenizer_name=None, lr=1e-5, weight_decay=0.01, warmup_ratio=0.1,
-                 precision="bf16-mixed"):
+    def __init__(self, model_id, save_name, extend_vocab_with=None, lr=1e-5, weight_decay=0.01,
+                 warmup_ratio=0.1, precision="bf16-mixed"):
         super().__init__()
         self.save_hyperparameters()
         self.model_id = model_id
@@ -40,8 +38,8 @@ class OLMoFSDP(pl.LightningModule):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        if tokenizer_name:
-            modify_olmo_tokenizer_to_chemfm(self, tokenizer_name)
+        if extend_vocab_with:
+            extend_tokenizer_vocab(self.tokenizer, extend_vocab_with)
 
     def configure_model(self):
         if self.model is not None:
@@ -56,9 +54,9 @@ class OLMoFSDP(pl.LightningModule):
             device_map=None,
             attn_implementation="sdpa",
         )
-        if self.hparams.tokenizer_name:
-            _replace_embeddings_for_tokenizer(self.model, self.tokenizer)
-
+        if self.hparams.extend_vocab_with:
+            base_tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
+            _extend_embeddings_for_tokenizer(self.model, self.tokenizer, base_tokenizer)
 
     def forward(self, input_ids, attention_mask, labels=None):
         return self.model(
@@ -217,10 +215,10 @@ class PubChemDataModule(pl.LightningDataModule):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FSDP full finetune on PubChem-10M SMILES (txt file)")
     parser.add_argument("--model_id", type=str, default="allenai/OLMo-7B-hf")
-    parser.add_argument("--tokenizer_name", type=str, default=None,
-                        help="Tokenizer to use instead of model_id's own "
-                        f"(e.g. ChemFM's tokenizer: {DEFAULT_CHEMFM_TOKENIZER_DIR}). "
-                        "Embeddings are resized to match.")
+    parser.add_argument("--extend_vocab_with", type=str, default=None,
+                        help="Tokenizer whose vocab is added to model_id's own, keeping the original "
+                        f"embeddings (e.g. ChemBERTa-3's: {DEFAULT_CHEMBERTA3_TOKENIZER}). "
+                        "New rows start as the mean of their pieces' embeddings.")
     parser.add_argument("--save_name", type=str, default="harindhar10/OLMo-7B-PubChem10M-full-finetune")
     parser.add_argument("--local_save_dir", type=str, default=None,
                         help="Where to save the model if not logged in to Hugging Face "
@@ -275,7 +273,7 @@ if __name__ == "__main__":
     pl_model = OLMoFSDP(
         model_id=args.model_id,
         save_name=args.save_name,
-        tokenizer_name=args.tokenizer_name,
+        extend_vocab_with=args.extend_vocab_with,
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
@@ -376,8 +374,9 @@ if __name__ == "__main__":
             trust_remote_code=True,
             low_cpu_mem_usage=True,
         )
-        if pl_model.hparams.tokenizer_name:
-            _replace_embeddings_for_tokenizer(reload_model, pl_model.tokenizer)
+        if pl_model.hparams.extend_vocab_with:
+            # Shapes only; the trained rows come from the checkpoint below.
+            _extend_embeddings_for_tokenizer(reload_model, pl_model.tokenizer)
 
         print('Reloading model from checkpoint:', ckpt_path)
 

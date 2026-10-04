@@ -33,11 +33,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from torchmetrics import Accuracy, AUROC
 
 
-DEFAULT_CHEMFM_TOKENIZER_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ChemFM",
-    "finetuning", "property_prediction", "tokenizer")
-
-
 def _is_transformer_layer(module) -> bool:
     """Model-agnostic match for a transformer decoder block.
 
@@ -108,13 +103,6 @@ class QLoRAAdapterCheckpoint(pl.Callback):
         if pl_module.tokenizer is not None:
             pl_module.tokenizer.save_pretrained(self.best_adapter_path)
 
-        if pl_module.hparams.tokenizer_name:
-            embedding_weight = backbone.get_input_embeddings().weight.detach().cpu()
-            torch.save(
-                embedding_weight,
-                os.path.join(self.best_adapter_path, "chemfm_embeddings.pt"),
-            )
-
         regressor_state = {
             name: tensor.detach().cpu()
             for name, tensor in pl_module.model.regressor.state_dict().items()
@@ -148,7 +136,7 @@ def run_regression_experiment(args: SimpleNamespace, task_name: str) -> None:
     log0(f"Target column: {task_config.target_column}")
 
     # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(getattr(args, "tokenizer_name", None) or args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -204,7 +192,6 @@ def run_regression_experiment(args: SimpleNamespace, task_name: str) -> None:
     # Model
     model = OLMoRegressor(
         model_name=args.model_name,
-        tokenizer_name=getattr(args, "tokenizer_name", None),
         finetune_strategy=args.finetune_strategy,
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -348,7 +335,6 @@ def run_regression_experiment(args: SimpleNamespace, task_name: str) -> None:
 
         model = OLMoRegressor(
             model_name=args.model_name,
-            tokenizer_name=getattr(args, "tokenizer_name", None),
             finetune_strategy=args.finetune_strategy,
             lr=args.lr,
             weight_decay=args.weight_decay,

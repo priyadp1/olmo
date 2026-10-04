@@ -36,11 +36,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from torchmetrics import Accuracy, AUROC
 
 
-DEFAULT_CHEMFM_TOKENIZER_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ChemFM",
-    "finetuning", "property_prediction", "tokenizer")
-
-
 def _is_transformer_layer(module) -> bool:
     """Model-agnostic match for a transformer decoder block.
 
@@ -53,8 +48,7 @@ def _is_transformer_layer(module) -> bool:
 
 
 class QLoRAClassifierCheckpoint(pl.Callback):
-    """Save only the PEFT adapter, classification head, and (if swapped) ChemFM
-    embeddings for the best validation score. """
+    """Save only the PEFT adapter and classification head for the best validation score."""
 
     def __init__(self, monitor: str, mode: str, dirpath: str):
         super().__init__()
@@ -112,13 +106,6 @@ class QLoRAClassifierCheckpoint(pl.Callback):
         if pl_module.tokenizer is not None:
             pl_module.tokenizer.save_pretrained(self.best_adapter_path)
 
-        if pl_module.hparams.tokenizer_name:
-            embedding_weight = backbone.get_input_embeddings().weight.detach().cpu()
-            torch.save(
-                embedding_weight,
-                os.path.join(self.best_adapter_path, "chemfm_embeddings.pt"),
-            )
-
         classifier_state = {
             name: tensor.detach().cpu()
             for name, tensor in pl_module.model.classifier.state_dict().items()
@@ -150,7 +137,7 @@ def run_classification_experiment(args: SimpleNamespace, task_name: str) -> None
     log0(f"Columns: {task_config.task_columns[:3]}")
 
     # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(getattr(args, "tokenizer_name", None) or args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -206,7 +193,6 @@ def run_classification_experiment(args: SimpleNamespace, task_name: str) -> None
     # Model
     model = OLMoClassifier(
         model_name=args.model_name,
-        tokenizer_name=getattr(args, "tokenizer_name", None),
         num_tasks=len(task_config.task_columns),
         task_type=task_config.task_type,
         finetune_strategy=args.finetune_strategy,
@@ -367,7 +353,6 @@ def run_classification_experiment(args: SimpleNamespace, task_name: str) -> None
 
         model = OLMoClassifier(
             model_name=args.model_name,
-            tokenizer_name=getattr(args, "tokenizer_name", None),
             num_tasks=len(task_config.task_columns),
             task_type=task_config.task_type,
             finetune_strategy=args.finetune_strategy,

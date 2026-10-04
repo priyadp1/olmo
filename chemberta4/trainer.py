@@ -6,7 +6,6 @@ with support for QLoRA and full finetuning.
 """
 
 
-import os
 from typing import Any, Dict, Optional
 
 import torch
@@ -40,64 +39,42 @@ def _compute_dtype_for_precision(precision: str) -> torch.dtype:
     return torch.float32
 
 
-def _replace_embeddings_for_tokenizer(model, tokenizer) -> None:
-    """Replace the model's input embeddings with a new embedding layer that matches the tokenizer's vocab size. """
-    old_embeddings = model.get_input_embeddings()
-    target_vocab_size = len(tokenizer)
-    hidden_size = old_embeddings.embedding_dim
-    new_embeddings = torch.nn.Embedding(target_vocab_size, hidden_size , padding_idx=tokenizer.pad_token_id , device = old_embeddings.weight.device , dtype = old_embeddings.weight.dtype)
-    initializer_range = getattr(model.config, "initializer_range", 0.02)
-    torch.nn.init.normal_(new_embeddings.weight, mean=0.0, std=initializer_range)
-    if tokenizer.pad_token_id is not None:
-        with torch.no_grad():
-            new_embeddings.weight[tokenizer.pad_token_id].zero_()
-    model.set_input_embeddings(new_embeddings)
-    old_head = model.get_output_embeddings()
-    if old_head is not None:
-        new_head = torch.nn.Linear(hidden_size, target_vocab_size, bias=False,
-                                   device=old_head.weight.device, dtype=old_head.weight.dtype)
-        if getattr(model.config, "tie_word_embeddings", False):
-            new_head.weight = new_embeddings.weight
-        else:
-            torch.nn.init.normal_(new_head.weight, mean=0.0, std=initializer_range)
-        model.set_output_embeddings(new_head)
-
-    model.config.vocab_size = target_vocab_size
-    if tokenizer.pad_token_id is not None:
-        model.config.pad_token_id = tokenizer.pad_token_id
+def extend_tokenizer_vocab(tokenizer, extra_tokenizer_name):
+    """Add another tokenizer's vocab (e.g. ChemBERTa's SMILES BPE) to 'tokenizer' in place."""
+    extra_tokenizer = AutoTokenizer.from_pretrained(extra_tokenizer_name)
+    base_vocab = tokenizer.get_vocab()
+    specials = set(extra_tokenizer.all_special_tokens)
+    # Sort by id so the added ids follow the source tokenizer's order (deterministic across ranks).
+    new_tokens = [
+        t for t, _ in sorted(extra_tokenizer.get_vocab().items(), key=lambda kv: kv[1])
+        if t not in base_vocab and t not in specials and t.isascii() and t.isprintable()
+    ]
+    tokenizer.add_tokens(new_tokens)
+    log0(f"[vocab extension] added {len(new_tokens)} tokens from {extra_tokenizer_name}; "
+         f"vocab size is now {len(tokenizer)}")
+    return new_tokens
 
 
-def _load_chemfm_embeddings_if_present(model, adapter_path: Optional[str]) -> None:
-    """Load a previously trained ChemFM embedding matrix saved next to a PEFT adapter.
-
-    QLoRA reload rebuilds the embedding layer via
-    '_replace_embeddings_for_tokenizer' (random init), then overwrites it here
-    with the trained weights the checkpoint callback saved alongside the
-    adapter, if any were saved.
-    """
-    if not adapter_path:
+def _extend_embeddings_for_tokenizer(model, tokenizer, base_tokenizer=None) -> None:
+    """Grow the embedding matrices to fit an extended tokenizer, keeping the existing rows."""
+    old_vocab_size = len(base_tokenizer) if base_tokenizer is not None else None
+    model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64, mean_resizing=False)
+    if base_tokenizer is None:
         return
-    embed_path = os.path.join(adapter_path, "chemfm_embeddings.pt")
-    if not os.path.exists(embed_path):
-        log0(
-            f"[ChemFM embeddings] WARNING: no saved embeddings found at "
-            f"{embed_path}; keeping the freshly random-initialized matrix. "
-            "Reloaded model will NOT have the trained embeddings."
-        )
-        return
-    embedding = model.get_input_embeddings()
-    saved_weight = torch.load(embed_path, map_location=embedding.weight.device)
+
+    input_weight = model.get_input_embeddings().weight
+    output_layer = model.get_output_embeddings()
+    output_weight = None
+    if output_layer is not None and output_layer.weight is not input_weight:
+        output_weight = output_layer.weight
+
     with torch.no_grad():
-        embedding.weight.copy_(saved_weight.to(embedding.weight.dtype))
-    log0(f"[ChemFM embeddings] restored trained weights from {embed_path}")
-
-
-def modify_olmo_tokenizer_to_chemfm(model, chemfm_tokenizer_dir):
-    """Swap a pl.LightningModule's tokenizer for ChemFM's own tokenizer."""
-    chemfm_tokenizer = AutoTokenizer.from_pretrained(chemfm_tokenizer_dir)
-    if chemfm_tokenizer.pad_token is None:
-        chemfm_tokenizer.pad_token = chemfm_tokenizer.eos_token
-    model.tokenizer = chemfm_tokenizer
+        for token_id in range(old_vocab_size, len(tokenizer)):
+            token = tokenizer.convert_ids_to_tokens(token_id)
+            piece_ids = base_tokenizer(token, add_special_tokens=False)["input_ids"]
+            input_weight[token_id] = input_weight[piece_ids].mean(dim=0)
+            if output_weight is not None:
+                output_weight[token_id] = output_weight[piece_ids].mean(dim=0)
 
 
 class OLMoClassifier(pl.LightningModule):
@@ -134,7 +111,6 @@ class OLMoClassifier(pl.LightningModule):
     def __init__(
         self,
         model_name: str = "allenai/OLMo-7B-hf",
-        tokenizer_name: Optional[str] = None,
         num_tasks: int = 1,
         task_type: str = "single_task",
         finetune_strategy: str = "qlora",
@@ -154,10 +130,6 @@ class OLMoClassifier(pl.LightningModule):
         ----------
         model_name : str
             HuggingFace model identifier.
-        tokenizer_name : str, optional
-            HuggingFace tokenizer identifier/path to use instead of
-            'model_name's own tokenizer (e.g. ChemFM's tokenizer over an
-            OLMo checkpoint). Embeddings are resized to match.
         num_tasks : int
             Number of classification tasks/labels.
         task_type : str
@@ -243,8 +215,6 @@ class OLMoClassifier(pl.LightningModule):
         self.tokenizer = AutoTokenizer.from_pretrained(hp.model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        if hp.tokenizer_name:
-            modify_olmo_tokenizer_to_chemfm(self, hp.tokenizer_name)
 
         # Quantization config (only for qlora)
         bnb_config = None
@@ -280,10 +250,6 @@ class OLMoClassifier(pl.LightningModule):
             device_map=None,
             attn_implementation="sdpa")
 
-        if hp.tokenizer_name:
-            _replace_embeddings_for_tokenizer(base, self.tokenizer)
-            _load_chemfm_embeddings_if_present(base, hp.adapter_path)
-
         if hp.finetune_strategy == "qlora":
             # Activation checkpointing is disabled (qwen3_5's forward is not
             # reproducible under recompute), so keep HF gradient checkpointing
@@ -317,17 +283,6 @@ class OLMoClassifier(pl.LightningModule):
 
             # if self.global_rank == 0 and not hp.adapter_path:
             #     base.print_trainable_parameters()
-
-        if hp.tokenizer_name:
-            # PEFT/kbit setup above freezes the base model; the newly
-            # created ChemFM embeddings must stay trainable regardless.
-            embedding_weight = base.get_input_embeddings().weight
-            embedding_weight.requires_grad_(True)
-            log0(
-                f"[ChemFM embeddings] "
-                f"shape={tuple(embedding_weight.shape)}, "
-                f"trainable={embedding_weight.requires_grad}"
-            )
 
         self.model = ClassificationHead(base, hp.num_tasks, hp.task_type,
                                         dtype=_weights_dtype_for_precision(hp.precision))
@@ -582,7 +537,6 @@ class OLMoRegressor(pl.LightningModule):
     def __init__(
         self,
         model_name: str = "allenai/OLMo-7B-hf",
-        tokenizer_name: Optional[str] = None,
         finetune_strategy: str = "qlora",
         lr: float = 2e-4,
         weight_decay: float = 0.01,
@@ -600,10 +554,6 @@ class OLMoRegressor(pl.LightningModule):
         ----------
         model_name : str
             HuggingFace model identifier.
-        tokenizer_name : str, optional
-            HuggingFace tokenizer identifier/path to use instead of
-            'model_name's own tokenizer (e.g. ChemFM's tokenizer over an
-            OLMo checkpoint). Embeddings are resized to match.
         finetune_strategy : str
             One of 'qlora', 'lora', or 'full_finetune'.
         lr : float
@@ -646,8 +596,6 @@ class OLMoRegressor(pl.LightningModule):
         self.tokenizer = AutoTokenizer.from_pretrained(hp.model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        if hp.tokenizer_name:
-            modify_olmo_tokenizer_to_chemfm(self, hp.tokenizer_name)
 
         bnb_config = None
         if hp.finetune_strategy == "qlora":
@@ -684,10 +632,6 @@ class OLMoRegressor(pl.LightningModule):
             device_map=None,
             attn_implementation="sdpa")
 
-        if hp.tokenizer_name:
-            _replace_embeddings_for_tokenizer(base, self.tokenizer)
-            _load_chemfm_embeddings_if_present(base, hp.adapter_path)
-
         if hp.finetune_strategy == "qlora":
             # Activation checkpointing is disabled (qwen3_5's forward is not
             # reproducible under recompute), so keep HF gradient checkpointing
@@ -718,17 +662,6 @@ class OLMoRegressor(pl.LightningModule):
             if self.global_rank == 0 and not hp.adapter_path:
                 # PEFT's own count, taken before FSDP wraps (authoritative).
                 base.print_trainable_parameters()
-
-        if hp.tokenizer_name:
-            # PEFT/kbit setup above freezes the base model; the newly
-            # created ChemFM embeddings must stay trainable regardless.
-            embedding_weight = base.get_input_embeddings().weight
-            embedding_weight.requires_grad_(True)
-            log0(
-                f"[ChemFM embeddings] "
-                f"shape={tuple(embedding_weight.shape)}, "
-                f"trainable={embedding_weight.requires_grad}"
-            )
 
         self.model = RegressionHead(base, dtype=_weights_dtype_for_precision(hp.precision))
         if hp.regressor_path:
