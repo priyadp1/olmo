@@ -301,7 +301,7 @@ if __name__ == "__main__":
     # ----------------------------
     # FSDP Strategy
     # ----------------------------
-    ''''
+   
     auto_wrap_policy = partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
@@ -318,7 +318,7 @@ if __name__ == "__main__":
         sync_module_states=True,
         state_dict_type="full",
     )
-'''
+
     # ----------------------------
     # Callbacks
     # ----------------------------
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=torch.cuda.device_count(),
-        #strategy=fsdp_strategy,
+        strategy=fsdp_strategy,
         precision=args.precision,
         max_epochs=args.max_epochs,
         val_check_interval=1.0 / args.num_val_per_epoch,
