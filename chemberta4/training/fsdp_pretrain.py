@@ -75,14 +75,16 @@ class OLMoFSDP(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True, on_step=True, sync_dist=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         outputs = self(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             labels=batch["labels"],
         )
         loss = outputs.loss
-        self.log("val_loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
+        # Loader 0 is SMILES (drives checkpointing); loader 1, if present, is Dolma.
+        name = "val_loss" if dataloader_idx == 0 else "val_loss_dolma"
+        self.log(name, loss, prog_bar=True, on_epoch=True, sync_dist=True, add_dataloader_idx=False)
         return loss
 
     def configure_optimizers(self):
@@ -146,8 +148,79 @@ class PubChemMapDataset(Dataset):
         return self.records[idx]
 
 
+DOLMA_URLS = "https://huggingface.co/datasets/allenai/dolma/resolve/main/urls/{version}.txt"
+
+
+def _iter_jsonl_gz_url(url):
+    import gzip
+    import json
+    import requests
+
+    with requests.get(url, stream=True, timeout=60) as response:
+        response.raise_for_status()
+        response.raw.decode_content = True
+        with gzip.GzipFile(fileobj=response.raw) as f:
+            for line in f:
+                yield json.loads(line)["text"]
+
+
+def iter_dolma_texts(version="v1_5-sample", sources=None, seed=0):
+    """Stream Dolma documents, mixing its sources (wiki, pes2o, books, stack, c4, ...)."""
+    import random
+    import requests
+    from collections import defaultdict
+
+    response = requests.get(DOLMA_URLS.format(version=version), timeout=60)
+    response.raise_for_status()
+    urls = response.text.split()
+
+    files_by_source = defaultdict(list)
+    for url in urls:
+        files_by_source[url.rstrip("/").split("/")[-2]].append(url)  # .../<source>/<file>.json.gz
+    if sources:
+        missing = set(sources) - set(files_by_source)
+        if missing:
+            raise ValueError(f"Dolma {version} has no source(s) {sorted(missing)}; "
+                             f"available: {sorted(files_by_source)}")
+        files_by_source = {s: files_by_source[s] for s in sources}
+
+    rng = random.Random(seed)
+    for files in files_by_source.values():
+        rng.shuffle(files)
+
+    def source_stream(files):
+        for url in files:
+            yield from _iter_jsonl_gz_url(url)
+
+    streams = {s: source_stream(files) for s, files in files_by_source.items()}
+    weights = {s: len(files) for s, files in files_by_source.items()}
+    while streams:
+        source = rng.choices(list(streams), weights=[weights[s] for s in streams])[0]
+        try:
+            yield next(streams[source])
+        except StopIteration:
+            del streams[source]
+
+
+def pack_dolma_chunks(tokenizer, texts, num_chunks, max_length):
+    """Concatenate documents (EOS-separated) and cut them into full max_length token chunks."""
+    chunks, buffer = [], []
+    for text in texts:
+        buffer.extend(tokenizer(text, add_special_tokens=False)["input_ids"])
+        buffer.append(tokenizer.eos_token_id)
+        while len(buffer) >= max_length and len(chunks) < num_chunks:
+            chunks.append(buffer[:max_length])
+            buffer = buffer[max_length:]
+        if len(chunks) >= num_chunks:
+            break
+    if len(chunks) < num_chunks:
+        print(f"[dolma] only found enough text for {len(chunks)}/{num_chunks} chunks")
+    return chunks
+
+
 class PubChemDataModule(pl.LightningDataModule):
-    def __init__(self, tokenizer, data_file, batch_size=4, num_samples=10_000, max_length=256, val_split=0.05):
+    def __init__(self, tokenizer, data_file, batch_size=4, num_samples=10_000, max_length=256, val_split=0.05,
+                 dolma_ratio=0.0, dolma_version="v1_5-sample", dolma_sources=None):
         super().__init__()
         self.tokenizer = tokenizer
         self.data_file = data_file
@@ -155,6 +228,10 @@ class PubChemDataModule(pl.LightningDataModule):
         self.num_samples = num_samples
         self.max_length = max_length
         self.val_split = val_split
+        self.dolma_ratio = dolma_ratio
+        self.dolma_version = dolma_version
+        self.dolma_sources = dolma_sources
+        self.dolma_val_dataset = None
 
     def setup(self, stage=None):
         records = []
@@ -167,19 +244,32 @@ class PubChemDataModule(pl.LightningDataModule):
                     records.append(smiles)
 
         split_idx = int(len(records) * (1 - self.val_split))
-        self.train_dataset = PubChemMapDataset(records[:split_idx])
+        train_records = records[:split_idx]
         self.val_dataset = PubChemMapDataset(records[split_idx:])
 
-    def _collate_fn(self, batch):
-        texts = [text + self.tokenizer.eos_token for text in batch]
+        if self.dolma_ratio > 0:
+            num_train = round(len(train_records) * self.dolma_ratio / (1 - self.dolma_ratio))
+            num_val = max(1, round(num_train * self.val_split))
+            texts = iter_dolma_texts(self.dolma_version, self.dolma_sources)
+            chunks = pack_dolma_chunks(self.tokenizer, texts, num_train + num_val, self.max_length)
+            train_records = train_records + chunks[num_val:]
+            self.dolma_val_dataset = PubChemMapDataset(chunks[:num_val])
+            print(f"[dolma] mixing {len(chunks) - num_val} Dolma {self.dolma_version} chunks "
+                  f"with {split_idx} SMILES")
 
-        encodings = self.tokenizer(
-            texts,
-            truncation=True,
-            max_length=self.max_length,
-            padding="longest",
-            return_tensors="pt",
-        )
+        self.train_dataset = PubChemMapDataset(train_records)
+
+    def _collate_fn(self, batch):
+        features = []
+        for item in batch:
+            if isinstance(item, str):  # SMILES string
+                ids = self.tokenizer(item + self.tokenizer.eos_token, truncation=True,
+                                     max_length=self.max_length)["input_ids"]
+            else:  # pre-packed Dolma chunk
+                ids = item
+            features.append({"input_ids": ids})
+
+        encodings = self.tokenizer.pad(features, padding="longest", return_tensors="pt")
 
         labels = encodings["input_ids"].clone()
         # labels[labels == self.tokenizer.pad_token_id] = -100
@@ -201,15 +291,20 @@ class PubChemDataModule(pl.LightningDataModule):
             pin_memory=True,
         )
 
-    def val_dataloader(self):
+    def _val_loader(self, dataset):
         return DataLoader(
-            self.val_dataset,
+            dataset,
             batch_size=self.batch_size,
             collate_fn=self._collate_fn,
             shuffle=False,
             num_workers=2,
             pin_memory=True,
         )
+
+    def val_dataloader(self):
+        if self.dolma_val_dataset is None:
+            return self._val_loader(self.val_dataset)
+        return [self._val_loader(self.val_dataset), self._val_loader(self.dolma_val_dataset)]
 
 
 if __name__ == "__main__":
@@ -238,6 +333,14 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--val_split", type=float, default=0.05,
                         help="Fraction of samples to use for validation (default: 0.05)")
+    parser.add_argument("--dolma_ratio", type=float, default=0.0,
+                        help="Fraction of training examples drawn from Dolma (OLMo's own pretraining data) "
+                        "to limit forgetting, ChemDFM-style. 0 disables; 0.33 ~ 1 Dolma : 2 SMILES")
+    parser.add_argument("--dolma_version", type=str, default="v1_5-sample",
+                        help="Dolma version: v1_5-sample is what OLMo-7B was trained on; use v1_7 for OLMo-7B-0424")
+    parser.add_argument("--dolma_sources", type=str, default=None,
+                        help="Comma-separated Dolma sources to keep, e.g. wiki,pes2o,books,stack "
+                        "(default: all, matching OLMo's original mix)")
     parser.add_argument("--wandb_logging", action="store_true", default=False,
                         help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_key", type=str, default=None,
@@ -287,6 +390,9 @@ if __name__ == "__main__":
         num_samples=args.num_samples,
         max_length=args.max_length,
         val_split=args.val_split,
+        dolma_ratio=args.dolma_ratio,
+        dolma_version=args.dolma_version,
+        dolma_sources=args.dolma_sources.split(",") if args.dolma_sources else None,
     )
 
     # Force model init to get transformer layer class for FSDP wrapping
@@ -416,6 +522,7 @@ if __name__ == "__main__":
 | Gradient Accumulation Steps | `{args.accumulate_grad_batches}` |
 | Max Sequence Length | `{args.max_length}` |
 | Num Training Samples | `{args.num_samples}` |
+| Dolma Mix | `{args.dolma_version if args.dolma_ratio > 0 else "none"}` (ratio `{args.dolma_ratio}`, sources `{args.dolma_sources or "all"}`) |
 | Precision | `{args.precision}` |
 | Gradient Clip Val | `1.0` |
 | Optimizer | AdamW (betas=(0.9, 0.95), eps=1e-5) |
