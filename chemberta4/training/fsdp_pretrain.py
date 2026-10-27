@@ -164,19 +164,31 @@ def _iter_jsonl_gz_url(url):
                 yield json.loads(line)["text"]
 
 
-def iter_dolma_texts(version="v1_5-sample", sources=None, seed=0):
+def iter_dolma_texts(version="v1_5-sample", sources=None, seed=0, local_dir=None):
     """Stream Dolma documents, mixing its sources (wiki, pes2o, books, stack, c4, ...)."""
     import random
     import requests
     from collections import defaultdict
 
-    response = requests.get(DOLMA_URLS.format(version=version), timeout=60)
-    response.raise_for_status()
-    urls = response.text.split()
+    if local_dir:
+        from pathlib import Path
+        root = Path(local_dir)
+        if not root.is_dir():
+            raise FileNotFoundError(f'Dolma local directory does not exist: {root}')
+        # Retain the source label by constructing a local mapping.
+        files_by_source = defaultdict(list)
+        for path in sorted(root.rglob('*.gz')):
+            files_by_source[path.parent.name].append(str(path))
+        if not files_by_source:
+            raise FileNotFoundError(f'No .gz Dolma shards found in {root}')
+    else:
+        response = requests.get(DOLMA_URLS.format(version=version), timeout=60)
+        response.raise_for_status()
+        urls = response.text.split()
+        files_by_source = defaultdict(list)
+        for url in urls:
+            files_by_source[url.rstrip("/").split("/")[-2]].append(url)
 
-    files_by_source = defaultdict(list)
-    for url in urls:
-        files_by_source[url.rstrip("/").split("/")[-2]].append(url)  # .../<source>/<file>.json.gz
     if sources:
         missing = set(sources) - set(files_by_source)
         if missing:
@@ -190,7 +202,14 @@ def iter_dolma_texts(version="v1_5-sample", sources=None, seed=0):
 
     def source_stream(files):
         for url in files:
-            yield from _iter_jsonl_gz_url(url)
+            if local_dir:
+                import gzip
+                import json
+                with gzip.open(url, 'rt', encoding='utf-8') as f:
+                    for line in f:
+                        yield json.loads(line)['text']
+            else:
+                yield from _iter_jsonl_gz_url(url)
 
     streams = {s: source_stream(files) for s, files in files_by_source.items()}
     weights = {s: len(files) for s, files in files_by_source.items()}
@@ -220,7 +239,7 @@ def pack_dolma_chunks(tokenizer, texts, num_chunks, max_length):
 
 class PubChemDataModule(pl.LightningDataModule):
     def __init__(self, tokenizer, data_file, batch_size=4, num_samples=10_000, max_length=256, val_split=0.05,
-                 dolma_ratio=0.0, dolma_version="v1_5-sample", dolma_sources=None):
+                 dolma_ratio=0.0, dolma_version="v1_5-sample", dolma_sources=None, dolma_local_dir=None):
         super().__init__()
         self.tokenizer = tokenizer
         self.data_file = data_file
@@ -231,6 +250,7 @@ class PubChemDataModule(pl.LightningDataModule):
         self.dolma_ratio = dolma_ratio
         self.dolma_version = dolma_version
         self.dolma_sources = dolma_sources
+        self.dolma_local_dir = dolma_local_dir
         self.dolma_val_dataset = None
 
     def setup(self, stage=None):
@@ -250,7 +270,7 @@ class PubChemDataModule(pl.LightningDataModule):
         if self.dolma_ratio > 0:
             num_train = round(len(train_records) * self.dolma_ratio / (1 - self.dolma_ratio))
             num_val = max(1, round(num_train * self.val_split))
-            texts = iter_dolma_texts(self.dolma_version, self.dolma_sources)
+            texts = iter_dolma_texts(self.dolma_version, self.dolma_sources, local_dir=self.dolma_local_dir)
             chunks = pack_dolma_chunks(self.tokenizer, texts, num_train + num_val, self.max_length)
             train_records = train_records + chunks[num_val:]
             self.dolma_val_dataset = PubChemMapDataset(chunks[:num_val])
@@ -336,6 +356,8 @@ if __name__ == "__main__":
     parser.add_argument("--dolma_ratio", type=float, default=0.0,
                         help="Fraction of training examples drawn from Dolma (OLMo's own pretraining data) "
                         "to limit forgetting, ChemDFM-style. 0 disables; 0.33 ~ 1 Dolma : 2 SMILES")
+    parser.add_argument("--dolma_local_dir", type=str, default=None,
+                        help="Read Dolma shards from this directory rather than HTTP")
     parser.add_argument("--dolma_version", type=str, default="v1_5-sample",
                         help="Dolma version: v1_5-sample is what OLMo-7B was trained on; use v1_7 for OLMo-7B-0424")
     parser.add_argument("--dolma_sources", type=str, default=None,
@@ -393,6 +415,7 @@ if __name__ == "__main__":
         dolma_ratio=args.dolma_ratio,
         dolma_version=args.dolma_version,
         dolma_sources=args.dolma_sources.split(",") if args.dolma_sources else None,
+        dolma_local_dir=args.dolma_local_dir,
     )
 
     # Force model init to get transformer layer class for FSDP wrapping
